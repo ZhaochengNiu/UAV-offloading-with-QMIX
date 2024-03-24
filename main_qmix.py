@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 from net import RNN
-from qmixnet import QMixNet
+from net import QMixNet
 import codecs
 import csv
 import matplotlib.pyplot as plt
@@ -27,7 +27,7 @@ N_STATES=24+50+3+20
 N_obs=12
 n_bs=5
 n_channel=10
-max_episode=800
+max_episode=10
 max_step=200
 s=np.zeros(16)
 s_=np.zeros(16)
@@ -144,19 +144,30 @@ flag=np.zeros(n_uav)
 class QMIX:
     def __init__(self,):
         # 神经网络
+        # 学习步数计数器，用于更新目标网络。
         self.learn_step_counter = 0  # for target updating
+        # 初始化记忆库，形状为 (MEMORY_CAPACITY, n_agents, N_STATES * 2 + N_obs * 2 + 3)，用于存储经验。
         self.memory = np.zeros((MEMORY_CAPACITY, n_agents,N_STATES * 2+N_obs*2 + 3))  # 初始记忆大小
+        # 创建每个agent选动作的评估用的RNN网络。
         self.eval_rnn = RNN().to(device)  # 每个agent选动作的网络
+        # 创建每个agent选动作的目标用的RNN网络。
         self.target_rnn = RNN().to(device)
+        # 创建用于把agentsQ值加起来的评估用的QMIX网络。
         self.eval_qmix_net = QMixNet().to(device)  # 把agentsQ值加起来的网络
+        # 创建用于把agentsQ值加起来的目标用的QMIX网络。
         self.target_qmix_net = QMixNet().to(device)
         # 让target_net和eval_net的网络参数相同
+        # 将目标网络的参数初始化为与评估网络相同。
         self.target_rnn.load_state_dict(self.eval_rnn.state_dict())
+        # 将评估网络的参数保存在 eval_parameters 列表中。
         self.target_qmix_net.load_state_dict(self.eval_qmix_net.state_dict())
 
         self.eval_parameters = list(self.eval_qmix_net.parameters()) + list(self.eval_rnn.parameters())
+        # 使用Adam优化器来优化评估网络的参数。
         self.optimizer = torch.optim.Adam(self.eval_parameters, lr=LR)
+        # 使用均方误差损失函数来计算QMIX网络的损失。
         self.loss_func = nn.MSELoss()
+        # 初始化评估和目标RNN网络的隐藏状态为None。
         self.memory_counter = 0
 
         # 执行过程中，要为每个agent都维护一个eval_hidden
@@ -166,39 +177,51 @@ class QMIX:
         print('Init alg QMIX')
 
     def learn(self, ):  # train_step表示是第几次学习，用来控制更新target_net网络的参数
+        # 如果学习步数（learn_step_counter）大于0且可以整除TARGET_REPLACE_ITER，
+        # 则更新目标网络（target_net）的参数为当前评估网络（eval_net）的参数。
         if self.learn_step_counter > 0 and self.learn_step_counter % TARGET_REPLACE_ITER == 0:
             self.target_rnn.load_state_dict(self.eval_rnn.state_dict())
             self.target_qmix_net.load_state_dict(self.eval_qmix_net.state_dict())
+        # 增加学习步数。
         self.learn_step_counter += 1
+        # 创建一个空数组，用于存储批量的记忆。
         b_memory = np.empty((BATCH_SIZE * timelength, 3, N_STATES * 2 + N_obs * 2 + 3))
+        # 从记忆中随机抽取一批索引。
         sample_index = np.random.choice(MEMORY_CAPACITY, BATCH_SIZE)
+        # 从记忆中随机抽取一批索引。
         for i in range(BATCH_SIZE):
             if sample_index[i] > MEMORY_CAPACITY - timelength:
                 sample_index[i] = sample_index[i] - timelength
             b_memory[i * timelength:i * timelength + timelength, :, :] = self.memory[np.arange(sample_index[i],sample_index[i] + timelength), :]
+        # 根据抽取的索引从记忆中获取批量的记忆。
+        # 创建一个用于掩码的数组。
         mask = np.zeros((BATCH_SIZE * timelength, 1))
+        # 调用方法获取评估和目标Q值。
         q_evals, q_targets = self.get_q_values(b_memory)
-
+        # 从记忆中获取状态、下一个状态和奖励，并将其重新形状以适应神经网络的输入。
         b_s = b_memory[:, :, 2 * N_obs + 2:2 * N_obs + 2 + N_STATES].reshape(BATCH_SIZE * timelength, n_agents, -1)
         b_s_ = b_memory[:, :, 2 * N_obs + 2 + N_STATES:2 * N_obs + 2 + 2 * N_STATES].reshape(BATCH_SIZE * timelength,n_agents, -1)
         b_r = b_memory[:, :, 2 * N_obs + 2 + 2 * N_STATES:2 * N_obs + 3 + 2 * N_STATES].reshape(BATCH_SIZE * timelength,n_agents, -1)
-
+        # 选择每个批次中第一个代理的状态、下一个状态和奖励。
         b_s = b_s[:, 0, :]
         b_s_ = b_s_[:, 0, :]
         b_r = b_r[:, 0, :]
+        # 根据状态是否为零来设置掩码。
         for i in range(BATCH_SIZE * timelength):
             if np.sum(b_s[i, :]) != 0:
                 mask[i, 0] = 1
+        # 将状态、下一个状态、奖励和掩码转换为PyTorch张量，并将其发送到GPU（如果可用）。
         b_r = b_r.reshape(BATCH_SIZE * timelength, 1)
         b_s = torch.tensor(b_s).to(device).float()
         b_s_ = torch.tensor(b_s_).to(device).float()
         b_r = torch.tensor(b_r).to(device).float()
         mask = torch.tensor(mask).to(device)
-
+        # 计算评估和目标QMIX网络的输出。
         q_total_eval = self.eval_qmix_net(q_evals, b_s)#MIX网络拟合全局Q
         q_total_target = self.target_qmix_net(q_targets, b_s_)
-
+        # 计算目标Q值。
         targets = b_r + gamma * q_total_target
+        # 计算TD误差和损失。
         td_error = (q_total_eval - targets.detach())
         mask_td = mask * td_error
         loss = ((mask_td ** 2).sum() / mask.sum()) * 0.5
@@ -496,12 +519,14 @@ def asso_uav_users():
 def obs_initial():
     obs[:,:]=0
     return obs
+
 def Puav_comnsume(uav_v):
     for i in range(n_uav):
         P_level = UAV_M ** 2 / (math.sqrt(2) * rou * A * math.sqrt((uav_v[i])**2+math.sqrt((((uav_v[i])**2)**2)+P_l)))
         P_drag = 0.125*0.012*rou*A*math.sqrt((uav_v[i])**2)*((uav_v[i])**2)
         P_fly[i] = P_level+P_drag
     return P_fly
+
 def loacation_back():
     if uav_x[0]<0 or uav_x[0]>2600 or uav_y[0]<0 or uav_y[0]>2550:
         uav_x[0]=800
@@ -516,28 +541,40 @@ def loacation_back():
 
 qmix=QMIX()
 for episode in range(max_episode):
+    # 在每个episode开始时，初始化无人机的位置。
     uav_x,uav_y=initial_loc()
+    # 将分数（score）数组的所有元素重置为0，以记录本次episode的总得分。
     score[:]=0
+    # 初始化评估用的隐藏状态，这是一个包含所有代理的隐藏状态的张量。
     eval_hstate = torch.zeros([n_agents, 1, rnn_hidden_dim])
     for step in range(max_step):
         t0 = time.time()
+        # 生成交通情况，这可能是一个模拟的任务生成函数。
         btraffic=taskgenerate()
+        # 更新状态变量s。
         s=s_
         for j in range(n_agents):
+            # 初始化或更新代理的观察值（obs）。如果是第一个时间步，则初始化状态，否则更新为下一个状态。
             if step==0:
                 o=obs_initial()   #状态初始化
                 obs[j, :]=o[j,:]
             obs[j,:]=obs_[j,:]
             o=obs[j,:]
+            # 代理选择动作，并更新评估隐藏状态。
             agent_action[j],eval_hstate[j,:]=qmix.choose_action(o,last_a[j],eval_hstate[j,:],j)
+        # 根据代理的动作更新无人机的位置和速度。
         uav_x,uav_y,uav_v= loactionchange(agent_action,uav_x,uav_y)
         print('action=', agent_action)
+        # 记录无人机的轨迹。
         trajectory_record()
         # 飞行结束后 初始化uav-user关联
         asso_uavusers = asso_uav_users()
+        # 计算无人机的飞行消耗。
         P_fly=Puav_comnsume(uav_v)  #o_作为下一个o
+        # 根据当前状态更新分数。
         score = u_score(score)
         for j in range(n_agents):
+            # 更新代理的下一个观察值、上一个动作和经验，并将其存储到经验数组中。
             obs_[j,:]=obsnext(j,agent_action)
             last_a_[j]=agent_action[j]
             xx=np.hstack((obs[j,:],last_a[j],obs_[j,:],last_a_[j]))
@@ -549,6 +586,7 @@ for episode in range(max_episode):
         reward_save[episode*max_step+step]=r
         temp_sr=np.zeros((n_agents,N_STATES*2+1))
         for j in range(n_agents):
+            # 将状态、下一个状态和奖励组合成一个数组并保存到临时数组中
             temp_sr[j,:]=np.hstack((s,s_,r))
         exp=np.hstack((exp_agent,temp_sr))
         qmix.store_transition(exp)
